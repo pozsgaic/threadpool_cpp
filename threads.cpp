@@ -6,6 +6,7 @@
 #include <functional>
 #include <algorithm>
 #include <queue>
+#include <future>
 #include <vector>
 #include <mutex>
 #include <shared_mutex>
@@ -16,33 +17,31 @@
 using namespace std;
 using namespace boost::filesystem;
 
-
-auto readFile = [](const string& filePath, int sleepMilli) {
+//  Test function to simulate reading a file and returns its length.  
+auto readFile = [](const string& filePath, int sleepMilli) -> size_t {
     int fileSize = 0;
 
     ifstream fs(filePath.c_str());
 
+    size_t numBytes = 0;
     if(fs.is_open()) {
-        string line;
-        int lineNo = 1;
-        while(getline(fs, line)) {
-        }
-        fs.close();
+        fs.seekg(0, ios::end);
+        numBytes = fs.tellg();
     }
 
-    cout << "Done reading file - " << filePath << endl;
+    fs.close();
     if(sleepMilli > 0) {
         this_thread::sleep_for(chrono::milliseconds(sleepMilli));
     }
 
-    cout << "Done sleeping - " << filePath << endl << flush;
+    return numBytes;
 };
 
 class ThreadPool {
 private:
     atomic_bool running_;
     vector<thread> threads_;
-    queue<function<void()>> jobs_;
+    queue<packaged_task<size_t()>> jobs_;
     mutable mutex mutex_;
     mutable condition_variable cond_;
     once_flag once_;
@@ -76,34 +75,33 @@ public:
 
     void run() {
         while(running_) {
-            function<void()> job;
+            packaged_task<size_t()> job;
             {
                 unique_lock<mutex> lock(mutex_);
-                cond_.wait(lock, [this] {
+                cond_.wait(lock, [&] {
                     return !jobs_.empty() || !running_;
                 });
 
                 if(!running_) {
                     return;
                 }
-                job = jobs_.front();
+                job = move(jobs_.front());
                 jobs_.pop();
                 lock.unlock();
             }
-            job();
+            if(job.valid()){
+                job();
+            }
         }
     }
 
-    void queueJob(const function<void()>& job) {
-        {
-            unique_lock<mutex> lock(mutex_);
-            jobs_.push(job);
-        }
+    void queueJob(packaged_task<size_t()>&& job) {
+        unique_lock<mutex> lock(mutex_);
+        jobs_.emplace(move(job));
     }
 
     void stop() {
         running_ = false;
-        cout << "Thread pool shutting down - signaling worker threads" << endl;
         cond_.notify_all();
 
         int i = 0;
@@ -115,12 +113,14 @@ public:
         cout << "Thread pool stopped gracefully" << endl;
     }
 
-    template<typename Func>
-    void submit_job(Func f) {
-        queueJob(function<void()>(f));
+    template<typename Func, class... Args>
+    future<size_t> submit_job(Func&& f, Args... args) {
+        packaged_task<size_t()> task(bind(move(f), args...));
+        future<size_t> fut = task.get_future();
+        queueJob(move(task));
         cond_.notify_one();
+        return fut;
     }
-
 };
 
 int main() {
@@ -131,13 +131,15 @@ int main() {
     string input;
     cin >> input;
 
+    vector<future<size_t>> bytesRead;
+
     while(input != "Q") {
         path dir(input);
         if(is_directory(dir)) {
             cout << "Processing files in directory " << input << endl;
             for(auto entry: directory_iterator(dir)) {
-                int sleepMillis = 5000;
-                pool.submit_job(bind(readFile, entry.path().string(), sleepMillis));
+                int sleepMillis = 100 + rand()%500;
+                bytesRead.push_back(pool.submit_job(readFile, entry.path().string(), sleepMillis));
             }
 
         } else {
@@ -146,6 +148,12 @@ int main() {
         cout << "Enter a directory and we'll process all .txt files in it" << endl;
         cout << "Or Q to quit" << endl << flush;
         cin >> input;
+    }
+    cout << "Counting bytes read...." << endl;
+    size_t total = 0;
+    for(auto iter = bytesRead.begin(); iter != bytesRead.end(); ++iter) {
+        total += iter->get();
+        cout << "Total = " << total << endl;
     }
     cout << "Exiting..." << endl;
 }
